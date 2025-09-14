@@ -7,16 +7,13 @@ import typing as t
 from dataclasses import dataclass
 from datetime import datetime, timezone
 
-import requests
+import yfinance as yf
 from fastmcp import FastMCP
 
 # -----------------------------------------------------------------------------
 # Configuration
 # -----------------------------------------------------------------------------
 SERVER_NAME = "Yahoo Finance MCP Server"
-BASE_URL = os.environ.get("YAHOO_FINANCE_BASE_URL", "https://query1.finance.yahoo.com")
-REQUEST_TIMEOUT = float(os.environ.get("REQUEST_TIMEOUT", "10"))
-USE_YFINANCE = os.environ.get("USE_YFINANCE", "0") == "1"
 
 # Yahoo chart accepted intervals and ranges (kept in sync with public endpoints)
 ALLOWED_INTERVALS = {
@@ -39,12 +36,6 @@ ISO_4217 = {
 # -----------------------------------------------------------------------------
 # Utilities
 # -----------------------------------------------------------------------------
-session = requests.Session()
-session.headers.update({
-    # A reasonable UA reduces 403s with some Yahoo frontends.
-    "User-Agent": "Mozilla/5.0 (compatible; FastMCP/1.0; +https://github.com/)"
-})
-
 def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
@@ -55,13 +46,6 @@ def _to_iso(ts: int | float | None) -> str | None:
         return datetime.fromtimestamp(int(ts), tz=timezone.utc).isoformat()
     except Exception:
         return None
-
-def _yahoo_get(path: str, params: dict | None = None) -> dict:
-    """GET helper that raises for non-OK responses and returns parsed JSON."""
-    url = f"{BASE_URL}{path}"
-    resp = session.get(url, params=params, timeout=REQUEST_TIMEOUT)
-    resp.raise_for_status()
-    return resp.json()
 
 def _require_interval(interval: str) -> str:
     if interval not in ALLOWED_INTERVALS:
@@ -85,16 +69,38 @@ def _currency_symbol(base: str, quote: str) -> str:
     # Yahoo FX pairs use the "BASEQUOTE=X" convention, e.g., "EURUSD=X".
     return f"{base}{quote}=X"
 
-def _quote_symbols(symbols: list[str]) -> dict:
-    """Return Yahoo v7 quote payload for the given symbols list."""
-    symbols_s = ",".join(symbols)
-    data = _yahoo_get("/v7/finance/quote", {"symbols": symbols_s})
-    return data
-
-def _chart(symbol: str, range_: str, interval: str) -> dict:
-    params = {"range": range_, "interval": interval, "events": "div,split"}
-    data = _yahoo_get(f"/v8/finance/chart/{symbol}", params)
-    return data
+def _yf_quote_payload(symbols: list[str]) -> dict:
+    tickers = yf.Tickers(" ".join(symbols))
+    results: list[dict] = []
+    for sym in symbols:
+        tk = tickers.tickers.get(sym)
+        if not tk:
+            continue
+        entry: dict = {"symbol": sym}
+        try:
+            fi = tk.fast_info
+            entry["regularMarketPrice"] = _safe_float(getattr(fi, "last_price", None))
+            lpt = getattr(fi, "last_price_time", None)
+            entry["regularMarketTime"] = int(lpt) if isinstance(lpt, (int, float)) else None
+            entry["currency"] = getattr(fi, "currency", None)
+            entry["exchange"] = getattr(fi, "exchange", None)
+        except Exception:
+            pass
+        # Enrich with names when inexpensive; ignore errors
+        try:
+            info = getattr(tk, "get_info", None)
+            info = info() if callable(info) else getattr(tk, "info", {})
+            if isinstance(info, dict):
+                entry["shortName"] = info.get("shortName")
+                entry["longName"] = info.get("longName")
+                entry["quoteType"] = info.get("quoteType")
+                entry["fullExchangeName"] = info.get("fullExchangeName") or info.get("exchange")
+                if entry.get("currency") is None:
+                    entry["currency"] = info.get("currency")
+        except Exception:
+            pass
+        results.append(entry)
+    return {"quoteResponse": {"result": results, "error": None}}
 
 def _safe_float(x: t.Any) -> float | None:
     try:
@@ -105,64 +111,33 @@ def _safe_float(x: t.Any) -> float | None:
     except Exception:
         return None
 
-# Optional fallback via yfinance (only if requested)
-def _yf_quote(symbols: list[str]) -> dict | None:
-    if not USE_YFINANCE:
-        return None
+def _yf_build_candles_from_history(hist) -> list[dict]:
+    if hist is None or getattr(hist, "empty", True):
+        return []
+    # Ensure timezone aware UTC
     try:
-        import yfinance as yf
-        tickers = yf.Tickers(" ".join(symbols))
-        result = []
-        for sym in symbols:
-            tk = tickers.tickers.get(sym)
-            if not tk:
-                continue
-            info = {}
-            # fast_info is fast and robust for price/time fields
-            try:
-                fi = tk.fast_info
-                info["symbol"] = sym
-                info["regularMarketPrice"] = _safe_float(getattr(fi, "last_price", None))
-                info["regularMarketTime"]  = int(getattr(fi, "last_price_time", 0)) if getattr(fi, "last_price_time", None) else None
-                info["currency"] = getattr(fi, "currency", None)
-                info["exchange"] = getattr(fi, "exchange", None)
-            except Exception:
-                pass
-            if info:
-                result.append(info)
-        return {"quoteResponse": {"result": result, "error": None}}
+        idx = hist.index.tz_convert("UTC")
     except Exception:
-        return None
-
-def _yf_chart(symbol: str, range_: str, interval: str) -> dict | None:
-    if not USE_YFINANCE:
-        return None
-    try:
-        import yfinance as yf
-        hist = yf.Ticker(symbol).history(period=range_, interval=interval, auto_adjust=False)
-        # Emulate the Yahoo chart structure minimally
-        if hist.empty:
-            return {"chart": {"result": None, "error": {"code": "Empty", "description": "No data"}}}
-        timestamps = [int(ts.timestamp()) for ts in hist.index.tz_convert("UTC").to_pydatetime()]
-        result = {
-            "meta": {"symbol": symbol},
-            "timestamp": timestamps,
-            "indicators": {
-                "quote": [{
-                    "open":  [ _safe_float(v) for v in hist["Open"].tolist() ],
-                    "high":  [ _safe_float(v) for v in hist["High"].tolist() ],
-                    "low":   [ _safe_float(v) for v in hist["Low"].tolist() ],
-                    "close": [ _safe_float(v) for v in hist["Close"].tolist() ],
-                    "volume":[ int(v) if (isinstance(v, (int,float)) and not math.isnan(v)) else None for v in hist["Volume"].tolist() ],
-                }],
-                "adjclose": [{
-                    "adjclose": [ _safe_float(v) for v in (hist["Adj Close"].tolist() if "Adj Close" in hist else hist["Close"].tolist()) ]
-                }]
-            }
-        }
-        return {"chart": {"result": [result], "error": None}}
-    except Exception:
-        return None
+        idx = hist.index
+    timestamps = [int(getattr(ts, "timestamp", lambda: int(ts.value // 1_000_000_000))()) if hasattr(ts, "timestamp") else int(ts.timestamp()) for ts in getattr(idx, "to_pydatetime", lambda: idx)()]
+    candles = []
+    opens = hist["Open"].tolist() if "Open" in hist else [None] * len(timestamps)
+    highs = hist["High"].tolist() if "High" in hist else [None] * len(timestamps)
+    lows = hist["Low"].tolist() if "Low" in hist else [None] * len(timestamps)
+    closes = hist["Close"].tolist() if "Close" in hist else [None] * len(timestamps)
+    adjs = hist["Adj Close"].tolist() if "Adj Close" in hist else closes
+    vols = hist["Volume"].tolist() if "Volume" in hist else [None] * len(timestamps)
+    for i, ts in enumerate(timestamps):
+        candles.append({
+            "time_utc": _to_iso(ts),
+            "open": _safe_float(opens[i] if i < len(opens) else None),
+            "high": _safe_float(highs[i] if i < len(highs) else None),
+            "low": _safe_float(lows[i] if i < len(lows) else None),
+            "close": _safe_float(closes[i] if i < len(closes) else None),
+            "adjclose": _safe_float(adjs[i] if i < len(adjs) else None),
+            "volume": int(vols[i]) if i < len(vols) and isinstance(vols[i], (int, float)) and not math.isnan(vols[i]) else None
+        })
+    return candles
 
 # -----------------------------------------------------------------------------
 # MCP Server
@@ -195,14 +170,8 @@ def get_currency_pair_rate(base_currency: str, quote_currency: str) -> dict:
     quote = _require_currency(quote_currency)
     symbol = _currency_symbol(base, quote)
 
-    data = None
-    try:
-        data = _quote_symbols([symbol])
-    except Exception:
-        # Optional fallback
-        data = _yf_quote([symbol]) or {"quoteResponse": {"result": [], "error": "unavailable"}}
-
-    result = (data.get("quoteResponse", {}) or {}).get("result", [])  # type: ignore
+    data = _yf_quote_payload([symbol])
+    result = (data.get("quoteResponse", {}) or {}).get("result", [])
     if not result:
         raise RuntimeError(f"No quote available for currency pair {base}/{quote} ({symbol}).")
 
@@ -238,7 +207,7 @@ def convert_currency_amount(amount: float, base_currency: str, quote_currency: s
         "symbol": quote_data["symbol"]
     }
 
-@mcp.tool(description="Historical candles for a currency pair. Choose an allowed range and interval (e.g., range='1mo', interval='1d').")
+# @mcp.tool(description="Historical candles for a currency pair. Choose an allowed range and interval (e.g., range='1mo', interval='1d').")
 def get_currency_pair_history(
     base_currency: str,
     quote_currency: str,
@@ -251,38 +220,10 @@ def get_currency_pair_history(
     interval_ = _require_interval(interval)
     symbol = _currency_symbol(base, quote)
 
-    data = None
-    try:
-        data = _chart(symbol, range_, interval_)
-    except Exception:
-        data = _yf_chart(symbol, range_, interval_)
-
-    chart = (data or {}).get("chart", {})
-    if not chart or chart.get("error"):
-        raise RuntimeError(f"Yahoo chart error for {symbol}: {chart.get('error')}")
-
-    results = chart.get("result") or []
-    if not results:
+    hist = yf.Ticker(symbol).history(period=range_, interval=interval_, auto_adjust=False)
+    candles = _yf_build_candles_from_history(hist)
+    if not candles:
         raise RuntimeError(f"No historical data for {symbol} with range={range_}, interval={interval_}.")
-
-    res = results[0]
-    timestamps: list[int] = res.get("timestamp", []) or []
-    ind = res.get("indicators", {}) or {}
-    quote_arr = (ind.get("quote", []) or [{}])[0]
-    adj_arr = (ind.get("adjclose", []) or [{}])[0]
-
-    candles = []
-    for i, ts in enumerate(timestamps):
-        candles.append({
-            "time_utc": _to_iso(ts),
-            "open":  _safe_float((quote_arr.get("open") or [None])[i] if i < len(quote_arr.get("open", [])) else None),
-            "high":  _safe_float((quote_arr.get("high") or [None])[i] if i < len(quote_arr.get("high", [])) else None),
-            "low":   _safe_float((quote_arr.get("low") or [None])[i] if i < len(quote_arr.get("low", [])) else None),
-            "close": _safe_float((quote_arr.get("close") or [None])[i] if i < len(quote_arr.get("close", [])) else None),
-            "adjclose": _safe_float((adj_arr.get("adjclose") or [None])[i] if i < len(adj_arr.get("adjclose", [])) else None),
-            "volume": int((quote_arr.get("volume") or [None])[i]) if i < len(quote_arr.get("volume", [])) and (quote_arr.get("volume") or [None])[i] is not None else None
-        })
-
     return {
         "pair": f"{base}/{quote}",
         "symbol": symbol,
@@ -297,11 +238,7 @@ def get_currency_pair_history(
 @mcp.tool(description="Get the latest quote for a single symbol (equity, index like ^GSPC, currency pair like EURUSD=X, or crypto like BTC-USD).")
 def get_quote(symbol: str) -> dict:
     sym = symbol.strip()
-    data = None
-    try:
-        data = _quote_symbols([sym])
-    except Exception:
-        data = _yf_quote([sym]) or {"quoteResponse": {"result": [], "error": "unavailable"}}
+    data = _yf_quote_payload([sym])
 
     result = (data.get("quoteResponse", {}) or {}).get("result", [])
     if not result:
@@ -329,11 +266,7 @@ def get_batch_quotes(symbols: list[str]) -> dict:
     if not symbols:
         raise ValueError("Provide at least one symbol.")
     syms = [s.strip() for s in symbols if s and s.strip()]
-    data = None
-    try:
-        data = _quote_symbols(syms)
-    except Exception:
-        data = _yf_quote(syms) or {"quoteResponse": {"result": [], "error": "unavailable"}}
+    data = _yf_quote_payload(syms)
 
     out: dict[str, dict] = {}
     for q in (data.get("quoteResponse", {}) or {}).get("result", []):
@@ -360,38 +293,10 @@ def get_history(symbol: str, range: str = "1mo", interval: str = "1d") -> dict:
     range_ = _require_range(range)
     interval_ = _require_interval(interval)
 
-    data = None
-    try:
-        data = _chart(sym, range_, interval_)
-    except Exception:
-        data = _yf_chart(sym, range_, interval_)
-
-    chart = (data or {}).get("chart", {})
-    if not chart or chart.get("error"):
-        raise RuntimeError(f"Yahoo chart error for {sym}: {chart.get('error')}")
-
-    results = chart.get("result") or []
-    if not results:
+    hist = yf.Ticker(sym).history(period=range_, interval=interval_, auto_adjust=False)
+    candles = _yf_build_candles_from_history(hist)
+    if not candles:
         raise RuntimeError(f"No historical data for {sym} with range={range_}, interval={interval_}.")
-
-    res = results[0]
-    timestamps: list[int] = res.get("timestamp", []) or []
-    ind = res.get("indicators", {}) or {}
-    quote_arr = (ind.get("quote", []) or [{}])[0]
-    adj_arr = (ind.get("adjclose", []) or [{}])[0]
-
-    candles = []
-    for i, ts in enumerate(timestamps):
-        candles.append({
-            "time_utc": _to_iso(ts),
-            "open":  _safe_float((quote_arr.get("open") or [None])[i] if i < len(quote_arr.get("open", [])) else None),
-            "high":  _safe_float((quote_arr.get("high") or [None])[i] if i < len(quote_arr.get("high", [])) else None),
-            "low":   _safe_float((quote_arr.get("low") or [None])[i] if i < len(quote_arr.get("low", [])) else None),
-            "close": _safe_float((quote_arr.get("close") or [None])[i] if i < len(quote_arr.get("close", [])) else None),
-            "adjclose": _safe_float((adj_arr.get("adjclose") or [None])[i] if i < len(adj_arr.get("adjclose", [])) else None),
-            "volume": int((quote_arr.get("volume") or [None])[i]) if i < len(quote_arr.get("volume", [])) and (quote_arr.get("volume") or [None])[i] is not None else None
-        })
-
     return {
         "symbol": sym,
         "range": range_,
@@ -402,19 +307,30 @@ def get_history(symbol: str, range: str = "1mo", interval: str = "1d") -> dict:
 @mcp.tool(description="Market summary for a region (e.g., 'US', 'GB', 'DE', 'JP'). Returns top indices and session state.")
 def get_market_summary(region: str = "US") -> dict:
     region = (region or "US").upper()
-    data = _yahoo_get("/v6/finance/quote/marketSummary", {"lang": "en", "region": region})
-    results = (data.get("marketSummaryResponse", {}) or {}).get("result", [])  # type: ignore
+    # Minimal curated index list per region; extend as needed.
+    region_indices: dict[str, list[str]] = {
+        "US": ["^GSPC", "^DJI", "^IXIC"],
+        "GB": ["^FTSE"],
+        "DE": ["^GDAXI"],
+        "FR": ["^FCHI"],
+        "JP": ["^N225"],
+        "HK": ["^HSI"],
+        "CN": ["000001.SS", "399001.SZ"],
+        "IN": ["^BSESN", "^NSEI"],
+    }
+    syms = region_indices.get(region, ["^GSPC", "^DJI", "^IXIC"])
+    data = _yf_quote_payload(syms)
     out = []
-    for r in results:
+    for q in (data.get("quoteResponse", {}) or {}).get("result", []):
         out.append({
-            "symbol": r.get("symbol"),
-            "short_name": r.get("shortName"),
-            "full_exchange_name": r.get("fullExchangeName"),
-            "market_state": r.get("marketState"),
-            "price": _safe_float((r.get("regularMarketPrice") or {}).get("raw")),
-            "change": _safe_float((r.get("regularMarketChange") or {}).get("raw")),
-            "change_percent": _safe_float((r.get("regularMarketChangePercent") or {}).get("raw")),
-            "time_utc": _to_iso((r.get("regularMarketTime") or {}).get("raw"))
+            "symbol": q.get("symbol"),
+            "short_name": q.get("shortName"),
+            "full_exchange_name": q.get("fullExchangeName") or q.get("exchange"),
+            "market_state": q.get("marketState"),
+            "price": _safe_float(q.get("regularMarketPrice")),
+            "change": None,
+            "change_percent": None,
+            "time_utc": _to_iso(q.get("regularMarketTime"))
         })
     return {"region": region, "indices": out}
 
@@ -426,11 +342,11 @@ def search_instruments(query: str, count: int = 10, news_count: int = 0) -> dict
     q = (query or "").strip()
     if not q:
         raise ValueError("Provide a non-empty query string.")
-    params = {"q": q, "quotesCount": int(count), "newsCount": int(news_count)}
-    data = _yahoo_get("/v1/finance/search", params)
-    quotes = data.get("quotes", []) or []
+    # yfinance Search API
+    s = yf.Search(q)
+    items = getattr(s, "results", []) or []
     out = []
-    for it in quotes:
+    for it in items[: int(count)]:
         out.append({
             "symbol": it.get("symbol"),
             "short_name": it.get("shortname") or it.get("shortName"),
@@ -440,7 +356,7 @@ def search_instruments(query: str, count: int = 10, news_count: int = 0) -> dict
             "score": _safe_float(it.get("score")),
             "sector": it.get("sector"),
             "industry": it.get("industry"),
-            "is_currency": bool(it.get("isYahooFinance", False)) and (it.get("quoteType") == "CURRENCY")
+            "is_currency": it.get("quoteType") == "CURRENCY"
         })
     return {"query": q, "results": out}
 
@@ -448,54 +364,43 @@ def search_instruments(query: str, count: int = 10, news_count: int = 0) -> dict
 def get_options_chain(symbol: str, expiration: str | None = None) -> dict:
     # expiration can be a UNIX seconds string; if omitted we return dates.
     sym = symbol.strip()
-    path = f"/v7/finance/options/{sym}"
-    params = {}
-    if expiration:
-        # Accept YYYY-MM-DD for convenience, convert to epoch if needed.
-        exp = expiration.strip()
-        if exp.isdigit():
-            params["date"] = exp
-        else:
-            # Try parse YYYY-MM-DD to epoch seconds (UTC midnight)
-            try:
-                dt = datetime.strptime(exp, "%Y-%m-%d").replace(tzinfo=timezone.utc)
-                params["date"] = str(int(dt.timestamp()))
-            except Exception:
-                raise ValueError("expiration must be UNIX seconds or YYYY-MM-DD.")
-    data = _yahoo_get(path, params or None)
-    opt = (data.get("optionChain", {}) or {}).get("result", [])  # type: ignore
-    if not opt:
-        raise RuntimeError(f"No options data for {sym}.")
-    meta = opt[0].get("quote", {}) or {}
-    expirations = [ _to_iso(d) for d in opt[0].get("expirationDates", []) ]
-    out: dict = {"symbol": sym, "underlying": {"price": _safe_float(meta.get("regularMarketPrice")), "currency": meta.get("currency")}}
-    if not expiration:
-        out["expirations_utc"] = expirations
-        return out
-    chains = opt[0].get("options", []) or []
-    if not chains:
-        return out | {"calls": [], "puts": []}
-    chain = chains[0]
-    calls = chain.get("calls", []) or []
-    puts = chain.get("puts", []) or []
-    def _fmt(o: dict) -> dict:
-        return {
-            "contract_symbol": o.get("contractSymbol"),
-            "strike": _safe_float(o.get("strike")),
-            "last_price": _safe_float(o.get("lastPrice")),
-            "bid": _safe_float(o.get("bid")),
-            "ask": _safe_float(o.get("ask")),
-            "volume": o.get("volume"),
-            "open_interest": o.get("openInterest"),
-            "in_the_money": o.get("inTheMoney"),
-            "implied_volatility": _safe_float(o.get("impliedVolatility")),
-            "expiration_utc": _to_iso(chain.get("expiration"))
+    tk = yf.Ticker(sym)
+    # If expiration is omitted, return list of available dates
+    exps = getattr(tk, "options", []) or []
+    out: dict = {"symbol": sym}
+    # Underlying price/currency
+    try:
+        fi = tk.fast_info
+        out["underlying"] = {
+            "price": _safe_float(getattr(fi, "last_price", None)),
+            "currency": getattr(fi, "currency", None)
         }
-    return out | {
-        "expiration_utc": _to_iso(chain.get("expiration")),
-        "calls": [_fmt(c) for c in calls],
-        "puts":  [_fmt(p) for p in puts]
-    }
+    except Exception:
+        out["underlying"] = {"price": None, "currency": None}
+    if not expiration:
+        out["expirations_utc"] = exps
+        return out
+    # Normalize YYYY-MM-DD
+    exp = expiration.strip()
+    if exp not in exps:
+        raise ValueError("expiration must be one of Ticker.options values in YYYY-MM-DD.")
+    chain = tk.option_chain(exp)
+    def _fmt_row(row: dict) -> dict:
+        return {
+            "contract_symbol": row.get("contractSymbol"),
+            "strike": _safe_float(row.get("strike")),
+            "last_price": _safe_float(row.get("lastPrice")),
+            "bid": _safe_float(row.get("bid")),
+            "ask": _safe_float(row.get("ask")),
+            "volume": row.get("volume"),
+            "open_interest": row.get("openInterest"),
+            "in_the_money": row.get("inTheMoney"),
+            "implied_volatility": _safe_float(row.get("impliedVolatility")),
+            "expiration_utc": exp
+        }
+    calls = [ _fmt_row(r) for r in chain.calls.to_dict("records") ] if hasattr(chain, "calls") else []
+    puts =  [ _fmt_row(r) for r in chain.puts.to_dict("records") ] if hasattr(chain, "puts") else []
+    return out | {"expiration_utc": exp, "calls": calls, "puts": puts}
 
 # -----------------------------------------------------------------------------
 # Convenience: crypto and indices helpers (wrappers over get_quote)
